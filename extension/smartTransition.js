@@ -1,6 +1,6 @@
 // NAME: Smart Transition
 // AUTHOR: local
-// VERSION: 0.6.0
+// VERSION: 0.7.0
 // DESCRIPTION: Crossfade for Spotify free on macOS. Requires SmartFade.app.
 
 (function SmartTransition() {
@@ -32,7 +32,9 @@
     const DRIFT_RAMP = 10;         // seconds to ease into the drift
     const DRIFT_WINDOW = 150;      // longest lead-in, seconds
     const DRIFT_MIN = 0.02, DRIFT_MAX = 0.05;
-    const MIN_LAG = 1.5;           // below this an overlap isn't worth it
+    const MIN_LAG = 1.5;           // shortest blend overlap worth doing
+    const MIN_FILTER_LAG = 1.0;    // shortest filtered overlap; below this Auto echoes out
+    const BLEND_MIN_LAG = 2.5;     // a blend squeezed below this sounds rushed → Auto uses a filtered blend instead
     const OVERLAPS = { short: 3, medium: 5, long: 8 };   // target overlap, seconds
     const RHYTHM_CONF = 0.25;      // mean beat confidence above which a track counts as rhythmic
     const DEFAULTS = {
@@ -149,7 +151,7 @@
     }
 
     /** How well do the two tracks fit → which technique Auto picks */
-    function assess(a, na, cut, firstSound, match) {
+    function assess(a, na, cut, firstSound, match, tempoKnown) {
         if (!na) return { mode: "echo", reason: "No analysis for the next track", keyOK: true };
         const rA = beatConf(a.beats, cut - 30, cut), rB = beatConf(na.beats, firstSound, firstSound + 30);
         const secA = [...(a.sections || [])].reverse().find((s) => s.start < cut - 1);
@@ -162,14 +164,16 @@
         const strongA = rA >= RHYTHM_CONF, strongB = rB >= RHYTHM_CONF;
         if (strongA && strongB) {
             if (match) return { ...info, mode: "blend", reason: keyOK ? "Both rhythmic, tempos within reach" : "Tempos align, keys clash — shorter overlap" };
-            if (!cfg.beatmatch) return { ...info, mode: "filter", reason: "Beat-matching is off" };
-            return { ...info, mode: "echo", reason: "Tempos too far apart to blend cleanly" };
+            if (!cfg.beatmatch) return { ...info, mode: "filter", reason: "Beat-matching is off — short filtered blend" };
+            if (!tempoKnown) return { ...info, mode: "filter", reason: "Tempo unclear — short filtered blend, kicks kept apart" };
+            return { ...info, mode: "filter", reason: "Tempos too far apart to beat-match — short filtered blend, kicks kept apart" };
         }
         return { ...info, mode: "filter", reason: "Low rhythmic drive — short filtered blend" };
     }
 
     // ─── Planning ──────────────────────────────────────────────────
-    function computePlan(uri, a, nextUri, na, pNow = 0) {
+    /** preview: the listener gets the whole lag up front (a short silent gap), so no drift is needed */
+    function computePlan(uri, a, nextUri, na, pNow = 0, preview = false) {
         const t = a.track, dur = t.duration;
         if (dur < MIN_TRACK_SEC) return null;
         const segs = a.segments || [], bars = a.bars || [], beats = a.beats || [];
@@ -206,12 +210,12 @@
         // 3) Tempo match (half/double-time aware)
         const pA = rawBeat(beats, cut - 20, cut);
         const bpmA = pA > 0 ? 60 / pA : null;
-        let bpmB = null, match = null;
+        let bpmB = null, match = null, tempoKnown = false;
         if (na && pA > 0) {
             const nb = na.beats || [];
             const pB = rawBeat(nb, firstSound, firstSound + 20);
             if (pB > 0) {
-                bpmB = 60 / pB;
+                bpmB = 60 / pB; tempoKnown = true;
                 let best = null;
                 for (const m of [0.5, 1, 2]) { const r = pA / (pB * m); if (!best || Math.abs(r - 1) < Math.abs(best.r - 1)) best = { r, m }; }
                 const firstBeat = nb.find((b) => b.start >= firstSound - 0.03);
@@ -222,7 +226,7 @@
         }
 
         // 4) Technique
-        const c = assess(a, na, cut, firstSound, match);
+        const c = assess(a, na, cut, firstSound, match, tempoKnown);
         let mode = cfg.style === "auto" ? c.mode : cfg.style;
         let reason = cfg.style === "auto" ? c.reason : "Set manually";
         let want = OVERLAPS[cfg.overlap];
@@ -233,18 +237,24 @@
         const echoPlan = (why) => {
             let outStart = cutIdx >= 2 ? bars[cutIdx - 2].start : cut - 8 * beatSec;
             outStart = clamp(outStart, cut - 10, cut - 2);
-            if (outStart < 20 || outStart < pNow + 1) return null;
-            return { ...common, mode: "echo", reason: why, prepAt: outStart, outStart, lag: 0, overlap: 0, match: null };
+            if (outStart < 20 || (!preview && outStart < pNow + 1)) return null;
+            return { ...common, mode: "echo", reason: why, prepAt: outStart, outStart, lag: 0, lag0: 0, overlap: 0, want: 0, match: null };
         };
         if (mode === "echo") return echoPlan(reason);
 
         // 5) Lead-in drift: slow the outgoing track by s (pitch preserved) so the listener falls `lag` seconds behind
         const rampSec = match ? Math.min(8 * match.periodA, 6) : 0;
+        if (match) match.rampSec = rampSec;
         const T1 = cut - rampSec;
+        const finalLag = (sd) => match ? (1 - ((1 - sd) + match.r) / 2) * rampSec : 0;
+        if (preview) {
+            const lag0 = clamp(want - finalLag(0), MIN_LAG, MAX_LAG_SEC - 4);
+            const lag = lag0 + finalLag(0);
+            return { ...common, mode, reason, want, prepAt: T1 - 1, driftStart: T1, drift: 0, lag0, lag, overlap: lag / (match ? match.r : 1), match };
+        }
         const T0min = Math.max(20, cut - DRIFT_WINDOW, pNow + 5);
         const avail = T1 - T0min;
-        if (avail < DRIFT_RAMP + 4) return echoPlan("Not enough of the track left to ease in");
-        const finalLag = (sd) => match ? (1 - ((1 - sd) + match.r) / 2) * rampSec : 0;
+        if (avail < DRIFT_RAMP + 4) return echoPlan("Too close to the end to build an overlap — echoing out");
         const lagFor = (sd, T0) => sd * DRIFT_RAMP / 2 + sd * Math.max(0, T1 - DRIFT_RAMP - T0) + finalLag(sd);
         let sd = (want - (match ? (1 - match.r) / 2 * rampSec : 0)) / (avail - DRIFT_RAMP / 2 + rampSec / 2);
         sd = clamp(sd, DRIFT_MIN, DRIFT_MAX);
@@ -254,10 +264,31 @@
             T0 = clamp(T1 - DRIFT_RAMP - hold, T0min, T1 - DRIFT_RAMP);
         }
         const lag = lagFor(sd, T0);
-        if (lag < MIN_LAG) return cfg.style === "auto" ? echoPlan("Too little time to build an overlap — echoing out") : null;
-        if (match) match.rampSec = rampSec;
+        if (cfg.style === "auto") {
+            // started late: a short filtered blend sounds smoother than a cramped blend or an echo
+            if (lag < MIN_FILTER_LAG) return echoPlan("Too little time to build an overlap — echoing out");
+            if (mode === "blend" && lag < BLEND_MIN_LAG) { mode = "filter"; reason = "Started late — short filtered blend"; want = Math.min(want, 3); }
+        } else if (lag < (mode === "filter" ? MIN_FILTER_LAG : MIN_LAG)) return null;
         const outRate = match ? match.r : 1 - sd;
-        return { ...common, mode, reason, prepAt: T0, driftStart: T0, drift: sd, lag, overlap: lag / outRate, match };
+        return { ...common, mode, reason, want, prepAt: T0, driftStart: T0, drift: sd, lag0: 0, lag, overlap: lag / outRate, match };
+    }
+
+    /** Outgoing playback rate SmartFade applies at Spotify time t once the plan is running */
+    function rateAt(plan, t) {
+        let r = 1;
+        if (plan.drift > 0 && t > plan.driftStart) r = 1 - plan.drift * Math.min(1, (t - plan.driftStart) / DRIFT_RAMP);
+        const m = plan.match;
+        if (m && engine.beatmatch && t > plan.cut - m.rampSec) r += (m.r - r) * Math.min(1, (t - (plan.cut - m.rampSec)) / m.rampSec);
+        return r;
+    }
+    /** How far the listener is behind Spotify at Spotify time t */
+    function lagAt(plan, t) {
+        let lag = plan.lag0 || 0;
+        const step = 0.25, end = Math.min(t, plan.cut);
+        for (let x = Math.min(plan.driftStart ?? plan.cut, plan.cut - (plan.match?.rampSec || 0)); x < end; x += step) {
+            lag += (1 - rateAt(plan, Math.min(x + step / 2, end))) * Math.min(step, end - x);
+        }
+        return Math.max(0, lag);
     }
 
     // ─── SmartFade schedules ───────────────────────────────────────
@@ -276,9 +307,10 @@
                 delayMs: beat, feedback: 0.55, watchdogMs: t0 + L + 8000,
             };
         }
-        const ramps = [{ p: "out.rate", to: 1 - plan.drift, at: Math.max(0, (plan.driftStart - p) * 1000), dur: DRIFT_RAMP * 1000 }];
+        const ramps = plan.drift > 0 ? [{ p: "out.rate", to: 1 - plan.drift, at: Math.max(0, (plan.driftStart - p) * 1000), dur: DRIFT_RAMP * 1000 }] : [];
         const msg = { type: "schedule", label: "prep", ramps, watchdogMs: ((plan.cut - p) + plan.lag) * 1000 + 8000,
-                      note: `drift ${(plan.drift * 100).toFixed(1)}% → ${plan.lag.toFixed(1)}s` };
+                      note: plan.lag0 > 0 ? `preview lag ${plan.lag0.toFixed(1)}s → ${plan.lag.toFixed(1)}s`
+                                          : `drift ${(plan.drift * 100).toFixed(1)}% → ${plan.lag.toFixed(1)}s` };
         if (plan.match && engine.beatmatch) {
             const m = plan.match;
             ramps.push({ p: "out.rate", to: m.r, at: Math.max(0, (plan.cut - m.rampSec - p) * 1000), dur: m.rampSec * 1000 });
@@ -302,7 +334,13 @@
             const m = plan.match;
             msg.align = { periodA: m.periodA, periodB: m.periodB, periodOut: m.periodOut, bFirst: m.bFirst };
         }
-        if (plan.mode === "filter") {
+        if (plan.mode === "filter" && !(plan.match && engine.beatmatch)) {
+            // beats can't be aligned: pull the outgoing bass first, only then open the incoming low end — kicks never stack
+            ramps.push({ p: "out.hp", to: 220, at: 0, dur: D * 0.25 });
+            ramps.push({ p: "out.lp", to: 600, at: 0, dur: D * 0.8 });
+            ramps.push({ p: "out.gain", to: 0, at: D * 0.1, dur: D * 0.8, curve: "cos" });
+            ramps.push({ p: "in.hp", to: 1200, at: 0, dur: 10 });
+        } else if (plan.mode === "filter") {
             ramps.push({ p: "out.lp", to: 500, at: 0, dur: D * 0.9 });
             ramps.push({ p: "out.gain", to: 0, at: D * 0.2, dur: D * 0.8, curve: "cos" });
             ramps.push({ p: "in.hp", to: 1500, at: 0, dur: 10 });
@@ -327,7 +365,11 @@
             };
         }
         const D = plan.overlap * 1000;
-        const ramps = plan.mode === "filter"
+        const aligned = plan.match && engine.beatmatch;
+        const ramps = plan.mode === "filter" && !aligned
+            ? [{ p: "in.gain", to: 1, at: 0, dur: D * 0.45, curve: "sin", anchor: "onset" },
+               { p: "in.hp", to: 10, at: D * 0.4, dur: D * 0.5, anchor: "onset" }]
+            : plan.mode === "filter"
             ? [{ p: "in.gain", to: 1, at: 0, dur: D * 0.4, curve: "sin", anchor: "onset" },
                { p: "in.hp", to: 10, at: 0, dur: D * 0.9, anchor: "onset" }]
             : [{ p: "in.gain", to: 1, at: 0, dur: D * 0.5, curve: "sin", anchor: "onset" },
@@ -337,10 +379,12 @@
 
     // ─── State machine ─────────────────────────────────────────────
     // idle → planned → prepped → cutting → idle (next track)
-    const freshState = (uri) => ({ uri, phase: "idle", plan: null, planning: false, note: "", lastProgress: 0, lastWall: 0,
-                                   wasPlaying: true, cutAt: 0, retryAt: 0 });
+    // engineDirty: SmartFade is holding a lag / running a schedule for this track, so cancelling must reset it.
+    const freshState = (uri) => ({ uri, phase: "idle", plan: null, planning: false, replan: false, note: "", gen: 0,
+                                   lastProgress: 0, lastWall: 0, wasPlaying: true, cutAt: 0, retryAt: 0,
+                                   engineDirty: false, dirtyUntil: 0, expectSeek: null, pauseGrace: 0, preview: false });
     let st = freshState(null);
-    let lastMix = null;   // { plan, until } — keeps the card meaningful while the overlap plays out
+    let lastMix = null;   // { plan, cutWall, until } — keeps the card meaningful while the overlap plays out
 
     const curItem = () => S.Player.data?.item;
     const nextTrackInfo = () => {
@@ -350,38 +394,45 @@
     const excluded = (item) => !(item?.uri || "").startsWith("spotify:track:") || item?.isAd || item?.type === "ad" || S.Player.getRepeat?.() === 2;
 
     function cancel(reason, retryMs = 1000) {
-        if (st.phase === "prepped" || st.phase === "cutting") send({ type: "reset", dur: 250, reason });
+        if (st.engineDirty) send({ type: "reset", dur: 250, reason });
         dbg("cancel:", reason);
-        st.phase = "idle"; st.plan = null; st.retryAt = Date.now() + retryMs;
+        st.gen++;
+        Object.assign(st, { phase: "idle", plan: null, replan: false, engineDirty: false, dirtyUntil: 0, expectSeek: null,
+                            preview: false, retryAt: Date.now() + retryMs });
     }
 
     async function makePlan(uri) {
-        const state = st;
-        state.planning = true;
-        let gotData = false;
+        const state = st, gen = ++st.gen;
+        state.planning = true; state.replan = false;
+        let plan = null, note = "", retry = 5000;
         try {
             const next = nextTrackInfo();
             const nextUri = next?.uri;
-            if (!nextUri?.startsWith("spotify:track:")) { st.note = "Queue is empty"; return; }
-            if (cfg.skipSameAlbum && curItem()?.album?.uri && curItem().album.uri === next?.metadata?.album_uri) { st.note = "Same album — playing gaplessly"; return; }
-            const [a, na] = await Promise.all([getAnalysis(uri), getAnalysis(nextUri)]);
-            if (st !== state || state.uri !== uri) return;
-            if (nextTrackInfo()?.uri !== nextUri) { state.note = "Queue changed"; state.retryAt = Date.now() + 1000; return; }
-            if (!a) { state.note = "Audio analysis unavailable"; return; }
-            gotData = true;
-            const plan = computePlan(uri, a, nextUri, na, S.Player.getProgress() / 1000);
-            if (!plan) { state.note = "Not enough of the track left to mix"; return; }
-            if (S.Player.getProgress() / 1000 > plan.prepAt - 1) { state.note = "Too late to mix this track"; return; }
-            plan.from = curItem()?.name || "";
-            plan.to = next?.metadata?.title || "";
-            state.plan = plan; state.phase = "planned"; state.note = "";
-            dbg("plan", plan);
+            if (!nextUri?.startsWith("spotify:track:")) note = "Queue is empty";
+            else if (cfg.skipSameAlbum && curItem()?.album?.uri && curItem().album.uri === next?.metadata?.album_uri) note = "Same album — playing gaplessly";
+            else {
+                const [a, na] = await Promise.all([getAnalysis(uri), getAnalysis(nextUri)]);
+                if (st !== state || state.gen !== gen) return;
+                if (nextTrackInfo()?.uri !== nextUri) { note = "Queue changed"; retry = 1000; }
+                else if (!a) note = "Audio analysis unavailable";
+                else {
+                    retry = 15000;
+                    const p = S.Player.getProgress() / 1000;
+                    plan = computePlan(uri, a, nextUri, na, p);
+                    if (!plan) note = "Not enough of the track left to mix";
+                    else if (p > plan.prepAt - 1) { plan = null; note = "Too late to mix this track"; }
+                    else { plan.from = curItem()?.name || ""; plan.to = next?.metadata?.title || ""; }
+                }
+            }
+        } catch (e) {
+            dbg("plan failed", e); note = "Planning failed";
         } finally {
             state.planning = false;
-            if (st === state && state.uri === uri && state.phase === "idle" && state.retryAt <= Date.now()) {
-                state.retryAt = Date.now() + (gotData ? 15000 : 5000);
-            }
         }
+        if (st !== state || state.gen !== gen || state.engineDirty && state.phase !== "idle") return;
+        state.plan = plan; state.phase = plan ? "planned" : "idle"; state.note = note;
+        if (!plan) state.retryAt = Date.now() + retry;
+        dbg("plan", plan || note);
     }
 
     function onTrackChange(uri) {
@@ -391,13 +442,18 @@
         if (prev.phase === "cutting") {
             const plan = prev.plan;
             if (plan.nextUri === uri) {
-                if (plan.inPoint > 0.5) S.Player.seek(Math.round(plan.inPoint * 1000));
+                if (plan.inPoint > 0.5) {
+                    S.Player.seek(Math.round(plan.inPoint * 1000));
+                    st.expectSeek = { to: plan.inPoint, until: Date.now() + 3000 };
+                }
                 send(inSchedule(plan));
-                lastMix = { plan, until: Date.now() + Math.max(plan.overlap, plan.inSec) * 1000 + 800 };
+                const D = Math.max(plan.overlap, plan.inSec) * 1000;
+                st.engineDirty = true; st.dirtyUntil = Date.now() + D + 1500;   // a pause/seek mid-overlap must still reset
+                lastMix = { plan, cutWall: prev.cutAt, until: Date.now() + D + 800 };
             } else {
                 send({ type: "reset", dur: 200, reason: "unexpected-track" });
             }
-        } else if (prev.phase === "prepped") {
+        } else if (prev.engineDirty) {
             send({ type: "reset", dur: 200, reason: "manual-change" });
         }
     }
@@ -407,7 +463,7 @@
         const uri = item?.uri || null;
         if (uri !== st.uri) onTrackChange(uri);
 
-        if (!cfg.enabled || !uri || excluded(item)) { if (st.phase !== "idle") cancel("disabled/excluded"); return; }
+        if (!cfg.enabled || !uri || excluded(item)) { if (st.phase !== "idle" || st.engineDirty) cancel("disabled/excluded"); return; }
 
         const playing = S.Player.isPlaying();
         const p = S.Player.getProgress() / 1000;
@@ -416,28 +472,41 @@
         const jumped = st.lastWall > 0 && Math.abs(p - expected) > 1.5;
         st.lastProgress = p; st.wasPlaying = playing; st.lastWall = nowWall;
 
+        // A seek we started ourselves (preview, intro trim): wait for it to land, don't treat it as the user's
+        if (st.expectSeek) {
+            const es = st.expectSeek;
+            if (Math.abs(p - es.to) < 1.5 || nowWall > es.until) {
+                st.expectSeek = null; st.pauseGrace = nowWall + 2000;
+                es.onArrive?.();
+            }
+            return;
+        }
+        if (st.dirtyUntil && nowWall > st.dirtyUntil) { if (st.phase === "idle" || st.phase === "planned") st.engineDirty = false; st.dirtyUntil = 0; }
+
         if (st.phase === "cutting") {
             if (nowWall - st.cutAt > (st.plan.natural ? 3000 : 1500)) cancel("skip-failed", 15000);
             return;
         }
-        if (jumped && (st.phase === "prepped" || st.phase === "planned")) {
-            cancel("seek");
-            return;
+        if (jumped) {
+            // SmartFade already holds a lag for this track → it no longer matches; start over from here
+            if (st.engineDirty) { cancel("seek", 300); return; }
+            // nothing running yet → quietly re-plan; the card keeps the old plan until the new one is ready
+            if (st.phase === "planned") { st.replan = true; st.retryAt = 0; }
         }
-        if (!playing) { if (st.phase === "prepped") cancel("paused"); return; }
+        if (!playing) { if (st.engineDirty && nowWall > st.pauseGrace) cancel("paused"); return; }
 
-        if (st.phase === "planned" && nextTrackInfo()?.uri !== st.plan.nextUri) { st.phase = "idle"; st.plan = null; st.retryAt = 0; }
-
-        if (st.phase === "idle") {
-            if (!st.planning && nowWall >= st.retryAt && ready()) makePlan(uri);
-            return;
+        if (st.phase === "planned" && nextTrackInfo()?.uri !== st.plan.nextUri) {
+            if (st.engineDirty) cancel("queue-changed", 0); else { st.replan = true; st.retryAt = 0; }
         }
+
+        if ((st.phase === "idle" || st.replan) && !st.planning && nowWall >= st.retryAt && ready()) makePlan(uri);
+        if (st.phase === "idle" || st.planning || st.replan) return;
 
         const plan = st.plan;
         if (st.phase === "planned" && p >= plan.prepAt - PREP_AHEAD_SEC) {
             if (!ready()) return;
             send(prepSchedule(plan, p));
-            st.phase = "prepped";
+            st.phase = "prepped"; st.engineDirty = true;
             if (cfg.debug) S.showNotification(`Smart Transition · ${MODE_NAMES[plan.mode]}`);
             return;
         }
@@ -449,6 +518,46 @@
                 if (!plan.natural) S.Player.next();
             }
         }
+    }
+
+    // ─── Preview ───────────────────────────────────────────────────
+    // Jumps to just before the transition and gives the listener the full lag up front (a short silent gap),
+    // so the preview sounds exactly like the real thing instead of a squeezed version of it.
+    const PREVIEW_LEAD = 10;   // seconds of the outgoing track heard before the mix begins
+    async function startPreview() {
+        const uri = st.uri, next = nextTrackInfo(), nextUri = next?.uri;
+        if (!uri || !nextUri?.startsWith("spotify:track:") || !ready() || st.phase === "cutting") return;
+        const state = st, gen = ++st.gen;
+        const [a, na] = await Promise.all([getAnalysis(uri), getAnalysis(nextUri)]);
+        if (st !== state || st.gen !== gen) return;
+        const plan = a && computePlan(uri, a, nextUri, na, 0, true);
+        if (!plan) { S.showNotification("Smart Transition · can't preview this track"); return; }
+        plan.from = curItem()?.name || ""; plan.to = next?.metadata?.title || "";
+        const echo = plan.mode === "echo";
+        const seekTo = Math.max(0, (echo ? plan.outStart : plan.cut - plan.lag) - PREVIEW_LEAD);
+        const gapMs = echo ? 0 : plan.lag0 * 1000;
+
+        send({ type: "schedule", label: "preview-mute", reset: true, ramps: [{ p: "out.gain", to: 0, at: 0, dur: 120 }], watchdogMs: 10000 });
+        const onArrive = () => {
+            if (st.plan !== plan) return;
+            if (echo) {
+                send({ type: "schedule", label: "preview-in", ramps: [{ p: "out.gain", to: 1, at: 400, dur: 400, curve: "sin" }], watchdogMs: 0 });
+                st.engineDirty = false;
+                return;
+            }
+            // muted, let the read head pass the seek, then hold it still for gapMs → the listener is exactly lag0 behind
+            const G = 500;
+            send({ type: "schedule", label: "preview", note: `gap ${plan.lag0.toFixed(1)}s`,
+                   ramps: [{ p: "out.rate", to: 0, at: G, dur: 20 },
+                           { p: "out.rate", to: 1, at: G + gapMs, dur: 20 },
+                           { p: "out.gain", to: 1, at: G + gapMs + 20, dur: 500, curve: "sin" }],
+                   watchdogMs: (plan.cut - seekTo + plan.lag) * 1000 + 15000 });
+        };
+        Object.assign(st, { phase: "planned", plan, note: "", replan: false, engineDirty: true, dirtyUntil: 0, preview: true,
+                            expectSeek: { to: seekTo, until: Date.now() + 4000, onArrive } });
+        if (Math.abs(S.Player.getProgress() / 1000 - seekTo) >= 1.5) S.Player.seek(Math.round(seekTo * 1000));
+        if (!S.Player.isPlaying()) S.Player.play();
+        S.showNotification(`Preview · ${MODE_NAMES[plan.mode]} in ~${Math.round(gapMs / 1000 + PREVIEW_LEAD + 1)} s`);
     }
 
     function startTicker(ms) {
@@ -482,8 +591,15 @@
 .stx-when.now{color:var(--a)}
 .stx-tracks{font-size:13px;color:var(--s);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .stx-tracks i{font-style:normal;opacity:.6;padding:0 6px}
-.stx-line{position:relative;height:3px;border-radius:2px;background:var(--f2);margin:16px 0 12px}
-.stx-zone{position:absolute;top:0;bottom:0;border-radius:2px;background:var(--a);opacity:.85}
+.stx-line{position:relative;height:4px;border-radius:2px;background:var(--f2);margin:16px 0 8px}
+.stx-zone,.stx-ease,.stx-skip{position:absolute;top:0;bottom:0;border-radius:2px}
+.stx-zone{background:var(--a);min-width:3px}
+.stx-ease{background:var(--a);opacity:.3}
+.stx-skip{background:repeating-linear-gradient(90deg,var(--f3) 0 3px,transparent 3px 6px)}
+.stx-legend{display:flex;flex-wrap:wrap;gap:4px 12px;font-size:11px;color:var(--s);margin-bottom:12px;font-variant-numeric:tabular-nums}
+.stx-legend i{display:inline-block;width:10px;height:4px;border-radius:2px;margin-right:5px;vertical-align:middle;background:var(--a)}
+.stx-legend i.e{opacity:.35}
+.stx-legend i.s{background:repeating-linear-gradient(90deg,var(--s) 0 2px,transparent 2px 4px)}
 .stx-ph{position:absolute;top:50%;width:9px;height:9px;margin:-4.5px 0 0 -4.5px;border-radius:50%;background:var(--t);transition:left .25s linear}
 .stx-chips{display:flex;flex-wrap:wrap;gap:6px}
 .stx-chip{font-size:11px;font-weight:600;padding:3px 9px;border-radius:999px;background:var(--f2);font-variant-numeric:tabular-nums}
@@ -560,14 +676,27 @@
 
         const live = !st.plan || st.phase === "prepped" || st.phase === "cutting";
         const p = st.plan ? S.Player.getProgress() / 1000 : plan.cut;
-        const zStart = plan.mode === "echo" ? plan.outStart : plan.cut - plan.overlap;
+        // The playhead is what you hear, which runs behind Spotify's own progress bar by the lag built so far
+        let heard = p;
+        if (!st.plan) heard = Math.min(plan.cut, plan.cut - plan.lag + (Date.now() - lastMix.cutWall) / 1000 * (plan.match?.r || 1));
+        else if (st.phase === "prepped" || st.phase === "cutting" || (st.preview && !st.expectSeek)) heard = p - lagAt(plan, p);
+        const echo = plan.mode === "echo";
+        const zStart = echo ? plan.outStart : plan.cut - plan.lag;
+        const eStart = echo ? zStart : Math.min(plan.driftStart ?? zStart, plan.cut - (plan.match?.rampSec || 0));
         let when;
-        if (!st.plan || st.phase === "cutting") when = "Mixing";
+        if (st.expectSeek) when = "Preparing…";
+        else if (!st.plan || st.phase === "cutting") when = "Mixing";
         else if (p >= plan.cut - 0.5) when = "Now";
         else when = `in ${fmt(plan.cut - p)}`;
 
-        const w0 = 0, w1 = plan.dur;
-        const pct = (x) => `${clamp((x - w0) / (w1 - w0), 0, 1) * 100}%`;
+        const pct = (x) => `${clamp(x / plan.dur, 0, 1) * 100}%`;
+        const span = (cls, a, b) => b - a > 0.05 ? `<div class="${cls}" style="left:${pct(a)};width:calc(${pct(b)} - ${pct(a)})"></div>` : "";
+        const skip = plan.dur - plan.cut;
+        const legend = [];
+        if (!echo && zStart - eStart > 1) legend.push(`<span><i class="e"></i>Ease in ${fmt(eStart)}</span>`);
+        legend.push(`<span><i></i>${echo ? "Echo" : "Mix"} ${fmt(zStart)}–${fmt(plan.cut)}</span>`);
+        if (skip > 1) legend.push(`<span><i class="s"></i>Skips last ${fmt(skip)}</span>`);
+        const shortened = !echo && plan.want && plan.lag < plan.want - 0.4;
 
         const c = plan.assess || {};
         const chips = [];
@@ -577,15 +706,18 @@
             chips.push(`${Math.round(plan.bpmA)} → ${Math.round(plan.bpmB)} BPM${stretch}`);
         }
         if (c.keyA && c.keyB) chips.push(`<span class="stx-chip${c.keyOK ? "" : " warn"}">${c.keyA} → ${c.keyB}</span>`);
-        if (plan.mode !== "echo") chips.push(`${plan.overlap.toFixed(1)}s overlap`);
+        if (!echo) chips.push(shortened ? `<span class="stx-chip warn">${plan.overlap.toFixed(1)}s overlap · shortened</span>` : `${plan.overlap.toFixed(1)}s overlap`);
 
+        const eyebrow = !st.plan ? "Mixing" : st.preview ? "Preview" : st.phase === "prepped" && heard < p - 0.2 ? "Easing in" : "Up next";
+        const why = shortened ? "Started late in the track, so there was less time to build the overlap. Preview plays the full version." : plan.reason;
         return `
-            <span class="stx-eyebrow">${!st.plan ? "Mixing" : "Up next"}</span>
+            <span class="stx-eyebrow">${eyebrow}</span>
             <div class="stx-mode"><b>${MODE_NAMES[plan.mode]}</b><span class="stx-when${when === "Now" || when === "Mixing" || live ? " now" : ""}">${when}</span></div>
             <div class="stx-tracks">${esc(plan.from) || "This track"}<i>→</i>${esc(plan.to) || "Next track"}</div>
-            <div class="stx-line"><div class="stx-zone" style="left:${pct(zStart)};right:0"></div><div class="stx-ph" style="left:${pct(p)}"></div></div>
+            <div class="stx-line">${span("stx-ease", eStart, zStart)}${span("stx-zone", zStart, plan.cut)}${span("stx-skip", plan.cut, plan.dur)}<div class="stx-ph" style="left:${pct(heard)}"></div></div>
+            <div class="stx-legend">${legend.join("")}</div>
             <div class="stx-chips">${chips.map((x) => x.startsWith("<") ? x : `<span class="stx-chip">${x}</span>`).join("")}</div>
-            <div class="stx-why">${esc(plan.reason)}</div>`;
+            <div class="stx-why">${esc(why)}</div>`;
     }
 
     function openSettings() {
@@ -639,14 +771,15 @@
             q(".stx-dot").className = `stx-dot ${es.cls}`;
             q(".stx-st").textContent = es.text;
             q(".stx-card").innerHTML = cardHTML();
-            q(".stx-ver").textContent = engine.version ? `SmartFade ${engine.version} · Extension 0.6` : "Extension 0.6";
-            q(".stx-preview").disabled = !st.plan || st.phase !== "planned";
+            q(".stx-ver").textContent = engine.version ? `SmartFade ${engine.version} · Extension 0.7` : "Extension 0.7";
+            q(".stx-preview").disabled = !ready() || !cfg.enabled || st.phase === "cutting" || !!st.expectSeek ||
+                !nextTrackInfo()?.uri?.startsWith("spotify:track:");
         }
 
         const apply = () => {
             saveCfg();
-            if (st.phase === "planned" || (st.phase === "idle" && !st.planning)) { st.phase = "idle"; st.plan = null; st.note = ""; st.retryAt = 0; }
             if (!cfg.enabled) cancel("disabled");
+            else if (st.phase === "idle" || (st.phase === "planned" && !st.engineDirty)) { st.gen++; st.planning = false; st.replan = true; st.note = ""; st.retryAt = 0; }
             refreshButton(); renderStatic(); renderLive();
         };
         qa(".stx-seg").forEach((g) => g.addEventListener("click", (e) => {
@@ -657,14 +790,7 @@
             apply();
         }));
         qa(".stx-sw").forEach((el) => el.addEventListener("change", () => { cfg[el.dataset.key] = el.checked; apply(); }));
-        q(".stx-preview").onclick = () => {
-            if (!st.plan) return;
-            S.PopupModal.hide();
-            const target = Math.max(0, st.plan.mode === "echo" ? st.plan.prepAt - 6 : Math.max(st.plan.prepAt - 3, st.plan.cut - 45));
-            st.phase = "idle"; st.plan = null; st.retryAt = 0;
-            S.Player.seek(Math.round(target * 1000));
-            if (!S.Player.isPlaying()) S.Player.play();
-        };
+        q(".stx-preview").onclick = () => { S.PopupModal.hide(); startPreview(); };
 
         renderStatic(); renderLive();
         const timer = setInterval(() => { if (!wrap.isConnected) { clearInterval(timer); return; } renderLive(); }, 500);
@@ -676,5 +802,5 @@
     connect();
     startTicker(40);
     window.smartTransition = { state: () => st, engine: () => engine, cfg,
-                               _test: { computePlan, prepSchedule, cutSchedule, inSchedule, assess, camelot, keyCompat, cardHTML } };
+                               _test: { computePlan, lagAt, startPreview, prepSchedule, cutSchedule, inSchedule, assess, camelot, keyCompat, cardHTML } };
 })();
