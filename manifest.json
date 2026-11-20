@@ -1,0 +1,9 @@
+{
+  "name": "SmartFade",
+  "description": "Crossfade for Spotify free on macOS. Requires the SmartFade app.",
+  "preview": "assets/preview.png",
+  "main": "extension/smartTransition.js",
+  "readme": "README.md",
+  "authors": [{ "name": "stevia7896", "url": "https://github.com/stevia7896" }],
+  "tags": ["crossfade", "automix", "macOS"]
+}

@@ -23,6 +23,7 @@
 
     // ─── Config ────────────────────────────────────────────────────
     const WS_URL = "ws://127.0.0.1:17890";
+    const RELEASES = "https://github.com/stevia7896/smartfade/releases/latest";
     const SETTINGS_KEY = "smarttransition:settings:v3";
     const SILENCE_DB = -45;
     const PREP_AHEAD_SEC = 3;
@@ -465,6 +466,7 @@
 .stx-empty{display:flex;flex-direction:column;justify-content:center;min-height:100px}
 .stx-empty b{font-size:16px;font-weight:700;margin-bottom:3px}
 .stx-empty span{font-size:12.5px;color:var(--s)}
+.stx-empty a{color:var(--t);text-decoration:underline;text-underline-offset:2px}
 .stx-sec{margin-bottom:6px}
 .stx-seg{display:flex;background:var(--f1);border-radius:9px;padding:3px;margin-top:8px}
 .stx-seg button{flex:1;border:0;background:transparent;color:var(--s);font:inherit;font-size:12.5px;font-weight:600;padding:6px 10px;border-radius:7px;cursor:pointer;transition:background .15s,color .15s}
@@ -517,7 +519,7 @@
     const empty = (title, sub) => `<div class="stx-empty"><b>${title}</b><span>${sub}</span></div>`;
 
     function cardHTML() {
-        if (!engine.connected) return empty("Engine offline", "Open SmartFade.app to enable transitions.");
+        if (!engine.connected) return empty("Engine offline", `Install and open <a href="${RELEASES}">SmartFade.app</a> to enable transitions.`);
         if (!engine.keylock) return empty("Update required", "Relaunch the latest SmartFade.app.");
         if (!engine.tapping) return empty("Waiting for audio", "Start playback in Spotify.");
         if (!cfg.enabled) return empty("Transitions off", "Tracks will play back to back.");

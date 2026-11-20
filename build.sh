@@ -4,7 +4,11 @@ cd "$(dirname "$0")"
 APP=build/SmartFade.app
 mkdir -p $APP/Contents/MacOS $APP/Contents/Resources
 cp assets/AppIcon.icns $APP/Contents/Resources/
-swiftc -O -swift-version 5 -o $APP/Contents/MacOS/SmartFade Sources/*.swift -framework CoreAudio -framework AudioToolbox
+for arch in arm64 x86_64; do
+  swiftc -O -swift-version 5 -target $arch-apple-macos14.4 -o build/SmartFade-$arch Sources/*.swift -framework CoreAudio -framework AudioToolbox
+done
+lipo -create build/SmartFade-arm64 build/SmartFade-x86_64 -output $APP/Contents/MacOS/SmartFade
+rm build/SmartFade-arm64 build/SmartFade-x86_64
 cat > $APP/Contents/Info.plist <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
