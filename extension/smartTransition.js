@@ -1,7 +1,7 @@
 // NAME: Smart Transition
 // AUTHOR: local
 // VERSION: 0.6.0
-// DESCRIPTION: DJ-style transitions for Spotify. Plans each mix from Spotify's audio analysis and drives the local SmartFade engine for overlap, beat-matching and filtering. Requires SmartFade.app.
+// DESCRIPTION: Crossfade for Spotify free on macOS. Requires SmartFade.app.
 
 (function SmartTransition() {
     const S = window.Spicetify;

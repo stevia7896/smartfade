@@ -17,7 +17,7 @@ cat > $APP/Contents/Info.plist <<PLIST
   <key>CFBundleShortVersionString</key><string>0.6.2</string>
   <key>LSMinimumSystemVersion</key><string>14.4</string>
   <key>LSUIElement</key><true/>
-  <key>NSAudioCaptureUsageDescription</key><string>SmartFade processes Spotify audio to create seamless transitions between tracks.</string>
+  <key>NSAudioCaptureUsageDescription</key><string>SmartFade processes Spotify audio to crossfade between tracks.</string>
 </dict></plist>
 PLIST
 codesign --force --sign - $APP
