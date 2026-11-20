@@ -38,4 +38,4 @@ Settings live behind the Smart Transition button in Spotify's top bar.
 - Logs are written to `~/Library/Logs/SmartFade.log`.
 - Rebuilding changes the app's signature, so macOS asks for the recording permission again.
 
-Not affiliated with Spotify.
+MIT License. Not affiliated with Spotify.
