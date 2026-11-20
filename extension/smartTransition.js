@@ -69,13 +69,27 @@
 
     // ─── SmartFade connection ──────────────────────────────────────
     let ws = null;
+    let hadConnection = false;
     const noEngine = () => ({ connected: false, tapping: false, output: "", overlap: false, beatmatch: false, keylock: false });
     let engine = noEngine();
 
     function connect() {
         try { ws = new WebSocket(WS_URL); } catch (e) { setTimeout(connect, 5000); return; }
-        ws.onopen = () => { engine.connected = true; send({ type: "hello" }); refreshButton(); };
-        ws.onclose = () => { engine = noEngine(); ws = null; refreshButton(); setTimeout(connect, 3000); };
+        ws.onopen = () => {
+            engine.connected = true;
+            send({ type: "hello" });
+            if (hadConnection) send({ type: "reset", dur: 250, reason: "reconnected" });
+            hadConnection = true;
+            refreshButton();
+        };
+        ws.onclose = () => {
+            if (hadConnection) {
+                st = freshState(st.uri);
+                st.retryAt = Date.now() + 1000;
+            }
+            lastMix = null;
+            engine = noEngine(); ws = null; refreshButton(); setTimeout(connect, 3000);
+        };
         ws.onerror = () => {};
         ws.onmessage = (e) => {
             try {
@@ -342,7 +356,8 @@
     }
 
     async function makePlan(uri) {
-        st.planning = true;
+        const state = st;
+        state.planning = true;
         let gotData = false;
         try {
             const next = nextTrackInfo();
@@ -350,30 +365,38 @@
             if (!nextUri?.startsWith("spotify:track:")) { st.note = "Queue is empty"; return; }
             if (cfg.skipSameAlbum && curItem()?.album?.uri && curItem().album.uri === next?.metadata?.album_uri) { st.note = "Same album — playing gaplessly"; return; }
             const [a, na] = await Promise.all([getAnalysis(uri), getAnalysis(nextUri)]);
-            if (st.uri !== uri) return;
-            if (!a) { st.note = "Audio analysis unavailable"; return; }
+            if (st !== state || state.uri !== uri) return;
+            if (nextTrackInfo()?.uri !== nextUri) { state.note = "Queue changed"; state.retryAt = Date.now() + 1000; return; }
+            if (!a) { state.note = "Audio analysis unavailable"; return; }
             gotData = true;
             const plan = computePlan(uri, a, nextUri, na, S.Player.getProgress() / 1000);
-            if (!plan) { st.note = "Not enough of the track left to mix"; return; }
-            if (S.Player.getProgress() / 1000 > plan.prepAt - 1) { st.note = "Too late to mix this track"; return; }
+            if (!plan) { state.note = "Not enough of the track left to mix"; return; }
+            if (S.Player.getProgress() / 1000 > plan.prepAt - 1) { state.note = "Too late to mix this track"; return; }
             plan.from = curItem()?.name || "";
             plan.to = next?.metadata?.title || "";
-            st.plan = plan; st.phase = "planned"; st.note = "";
+            state.plan = plan; state.phase = "planned"; state.note = "";
             dbg("plan", plan);
         } finally {
-            st.planning = false;
-            if (st.uri === uri && st.phase === "idle") st.retryAt = Date.now() + (gotData ? 15000 : 5000);
+            state.planning = false;
+            if (st === state && state.uri === uri && state.phase === "idle" && state.retryAt <= Date.now()) {
+                state.retryAt = Date.now() + (gotData ? 15000 : 5000);
+            }
         }
     }
 
     function onTrackChange(uri) {
         const prev = st;
         st = freshState(uri);
+        lastMix = null;
         if (prev.phase === "cutting") {
             const plan = prev.plan;
-            if (plan.nextUri === uri && plan.inPoint > 0.5) S.Player.seek(Math.round(plan.inPoint * 1000));
-            send(inSchedule(plan));
-            lastMix = { plan, until: Date.now() + Math.max(plan.overlap, plan.inSec) * 1000 + 800 };
+            if (plan.nextUri === uri) {
+                if (plan.inPoint > 0.5) S.Player.seek(Math.round(plan.inPoint * 1000));
+                send(inSchedule(plan));
+                lastMix = { plan, until: Date.now() + Math.max(plan.overlap, plan.inSec) * 1000 + 800 };
+            } else {
+                send({ type: "reset", dur: 200, reason: "unexpected-track" });
+            }
         } else if (prev.phase === "prepped") {
             send({ type: "reset", dur: 200, reason: "manual-change" });
         }
@@ -390,15 +413,18 @@
         const p = S.Player.getProgress() / 1000;
         const nowWall = Date.now();
         const expected = st.lastProgress + (st.wasPlaying ? (nowWall - (st.lastWall || nowWall)) / 1000 : 0);
-        const jumped = st.lastWall > 0 && playing && Math.abs(p - expected) > 1.5;
+        const jumped = st.lastWall > 0 && Math.abs(p - expected) > 1.5;
         st.lastProgress = p; st.wasPlaying = playing; st.lastWall = nowWall;
 
         if (st.phase === "cutting") {
             if (nowWall - st.cutAt > (st.plan.natural ? 3000 : 1500)) cancel("skip-failed", 15000);
             return;
         }
+        if (jumped && (st.phase === "prepped" || st.phase === "planned")) {
+            cancel("seek");
+            return;
+        }
         if (!playing) { if (st.phase === "prepped") cancel("paused"); return; }
-        if (jumped && (st.phase === "prepped" || st.phase === "planned")) cancel("seek");
 
         if (st.phase === "planned" && nextTrackInfo()?.uri !== st.plan.nextUri) { st.phase = "idle"; st.plan = null; st.retryAt = 0; }
 
@@ -534,13 +560,13 @@
 
         const live = !st.plan || st.phase === "prepped" || st.phase === "cutting";
         const p = st.plan ? S.Player.getProgress() / 1000 : plan.cut;
-        const zStart = plan.mode === "echo" ? plan.outStart : plan.driftStart;
+        const zStart = plan.mode === "echo" ? plan.outStart : plan.cut - plan.overlap;
         let when;
         if (!st.plan || st.phase === "cutting") when = "Mixing";
         else if (p >= plan.cut - 0.5) when = "Now";
         else when = `in ${fmt(plan.cut - p)}`;
 
-        const w0 = Math.max(0, zStart - 40), w1 = plan.cut;
+        const w0 = 0, w1 = plan.dur;
         const pct = (x) => `${clamp((x - w0) / (w1 - w0), 0, 1) * 100}%`;
 
         const c = plan.assess || {};
