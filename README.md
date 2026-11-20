@@ -21,6 +21,7 @@
 
 Requires macOS 14.4+.
 
+0.Install **specetify**(https://github.com/spicetify/cli)
 1. Install **SmartFade** and [**adblockify**](https://github.com/rxri/spicetify-extensions/tree/main/adblock) from the Spicetify Marketplace.
 2. Download [SmartFade](https://github.com/stevia7896/smartfade/releases/latest), drag it to Applications and open it.
 
