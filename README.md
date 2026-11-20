@@ -4,7 +4,7 @@
 
 <h1 align="center">SmartFade</h1>
 
-<p align="center">Beat-matched transitions for Spotify on macOS.</p>
+<p align="center">Crossfade for Spotify free on macOS.</p>
 
 <br>
 
