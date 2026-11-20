@@ -21,13 +21,9 @@
 
 Requires macOS 14.4+.
 
-1. Install **SmartFade** and [**adblockify**](https://github.com/rxri/spicetify-extensions/tree/main/adblock) from the Spicetify Marketplace. Without adblockify, ads between tracks break transitions.
+1. Install **SmartFade** and [**adblockify**](https://github.com/rxri/spicetify-extensions/tree/main/adblock) from the Spicetify Marketplace.
 2. Download [SmartFade.app](https://github.com/stevia7896/smartfade/releases/latest), move it to Applications and open it.
 
-The app isn't notarized. On first launch, allow it in System Settings → Privacy & Security.
-
-<details>
-<summary>Build from source</summary>
 
 ```sh
 ./build.sh
