@@ -4,13 +4,13 @@
 
 <h1 align="center">SmartFade</h1>
 
-<p align="center">Crossfade for Spotify free on macOS.</p>
+<p align="center">Smooth transitions for Spotify on macOS.</p>
 
 <br>
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/how-dark.svg">
-  <img src="assets/how-light.svg" width="100%" alt="The outgoing track slows slightly, then overlaps the incoming track with beats aligned">
+  <img src="assets/how-light.svg" width="100%" alt="The song plays at original speed; only its last 1–4 bars are filtered, the final beat echoes out and the next track fades in under the echo">
 </picture>
 
 <p align="center">
