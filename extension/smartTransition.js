@@ -34,7 +34,7 @@
         overlap: "medium",          // transition length (key kept for saved settings)
         trimOutro: true,
         trimSilence: true,
-        skipSameAlbum: true,
+        gaplessAlbums: false,       // off: albums get transitions too (replaces skipSameAlbum, which defaulted on)
         debug: false,
     };
     const STYLES = {
@@ -49,6 +49,7 @@
         try { Object.assign(c, JSON.parse(S.LocalStorage.get(SETTINGS_KEY) || "{}")); } catch (_) {}
         if (!STYLES[c.style]) c.style = DEFAULTS.style;
         if (!LENGTHS[c.overlap]) c.overlap = DEFAULTS.overlap;
+        delete c.skipSameAlbum;
         return c;
     })();
     const saveCfg = () => S.LocalStorage.set(SETTINGS_KEY, JSON.stringify(cfg));
@@ -267,6 +268,7 @@
         const n = S.Queue?.nextTracks?.find((x) => x?.contextTrack?.uri && x.provider !== "ad" && x.contextTrack.uri !== "spotify:delimiter");
         return n?.contextTrack || null;
     };
+    const sameAlbum = (next) => !!(cfg.gaplessAlbums && curItem()?.album?.uri && curItem().album.uri === next?.metadata?.album_uri);
     const excluded = (item) => !(item?.uri || "").startsWith("spotify:track:") || item?.isAd || item?.type === "ad" || S.Player.getRepeat?.() === 2;
 
     function cancel(reason, retryMs = 1000) {
@@ -285,7 +287,7 @@
             const next = nextTrackInfo();
             const nextUri = next?.uri;
             if (!nextUri?.startsWith("spotify:track:")) note = "Queue is empty";
-            else if (cfg.skipSameAlbum && curItem()?.album?.uri && curItem().album.uri === next?.metadata?.album_uri) note = "Same album — playing gaplessly";
+            else if (sameAlbum(next)) note = "Same album — playing gaplessly";
             else {
                 const [a, na] = await Promise.all([getAnalysis(uri), getAnalysis(nextUri)]);
                 if (st !== state || state.gen !== gen) return;
@@ -392,7 +394,8 @@
     const PREVIEW_LEAD = 6;   // seconds of normal playback before the transition starts
     async function startPreview() {
         const uri = st.uri, next = nextTrackInfo(), nextUri = next?.uri;
-        if (!uri || !nextUri?.startsWith("spotify:track:") || !ready() || st.phase === "cutting") return;
+        if (!uri || !nextUri?.startsWith("spotify:track:") || !ready() || st.phase === "cutting" || excluded(curItem())) return;
+        if (sameAlbum(next)) { S.showNotification("Smart Transition · same album, plays gaplessly"); return; }
         const state = st, gen = ++st.gen;
         const [a, na] = await Promise.all([getAnalysis(uri), getAnalysis(nextUri)]);
         if (st !== state || st.gen !== gen) return;
@@ -580,7 +583,7 @@
                     <summary>Advanced</summary>
                     ${row("Skip long fade-outs", sw("trimOutro"))}
                     ${row("Trim silence", sw("trimSilence"))}
-                    ${row("Gapless within albums", sw("skipSameAlbum"))}
+                    ${row("Gapless within albums", sw("gaplessAlbums"))}
                     ${row("Debug logging", sw("debug"))}
                 </details>
                 <div class="stx-foot">
@@ -602,8 +605,9 @@
             q(".stx-st").textContent = es.text;
             q(".stx-card").innerHTML = cardHTML();
             q(".stx-ver").textContent = engine.version ? `SmartFade ${engine.version} · Extension 0.8` : "Extension 0.8";
+            const nx = nextTrackInfo();
             q(".stx-preview").disabled = !ready() || !cfg.enabled || st.phase === "cutting" || !!st.expectSeek ||
-                !nextTrackInfo()?.uri?.startsWith("spotify:track:");
+                !nx?.uri?.startsWith("spotify:track:") || excluded(curItem()) || sameAlbum(nx);
         }
 
         const apply = () => {
